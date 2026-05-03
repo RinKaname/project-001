@@ -42,7 +42,11 @@ print("Initializing Data Ingestion Pipeline...")
 print("Target Dataset: togethercomputer/RedPajama-Data-1T (Sample)")
 
 # In actual Kaggle execution, this would be:
-# dataset = load_dataset("togethercomputer/RedPajama-Data-1T", split="train", streaming=True)
+# Note: Hugging Face datasets >= 3.0 blocks all custom scripts.
+# To load RedPajama, we must directly target the underlying JSONL/Parquet files
+# or use a modern, script-free equivalent like SlimPajama to save time:
+# dataset = load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
+#
 # We mock the dataloader for this structural template.
 
 class MockDataloader:
