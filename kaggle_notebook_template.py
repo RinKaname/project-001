@@ -138,9 +138,22 @@ class ZeroGradientSSM4B(nn.Module):
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def parameter_summary(self):
+        print("\n" + "="*50)
+        print(f"{'Layer Type':<25} | {'Parameters':<15}")
+        print("="*50)
+        total_params = 0
+        for name, module in self.named_children():
+            params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            print(f"{name:<25} | {params:,}")
+            total_params += params
+        print("="*50)
+        print(f"{'Total Trainable Params':<25} | {total_params:,}")
+        print("="*50 + "\n")
+
 print("Initializing 4 Billion Parameter Architecture from raw tensor seeds...")
 model = ZeroGradientSSM4B()
-print(f"Total Trainable Parameters Instantiated: {model.count_parameters():,}")
+model.parameter_summary()
 print("Verification: No pre-trained weights loaded.")
 
 # %% [markdown]
