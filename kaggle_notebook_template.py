@@ -74,23 +74,32 @@ import torch.nn.functional as F
 
 class LocalSelectiveSSMLayer(nn.Module):
     """
-    A single Selective SSM block. Note that in a full 4B model,
-    the dimensions (d_model) would be significantly larger (e.g., 4096).
+    A single Selective SSM block coupled with an FFN block.
+    Uses a tied embedding matrix for the local zero-gradient update to save VRAM.
     """
-    def __init__(self, d_model, vocab_size, state_size=16):
+    def __init__(self, d_model, vocab_size, tied_embedding_weight, state_size=16):
         super().__init__()
         self.d_model = d_model
         self.state_size = state_size
+        self.vocab_size = vocab_size
 
-        # SSM Parameters
+        # --- SSM Parameters ---
         self.A_log = nn.Parameter(torch.log(torch.rand(d_model, state_size) * 0.9 + 0.1))
         self.D = nn.Parameter(torch.ones(d_model))
         self.proj_delta = nn.Linear(d_model, d_model)
         self.proj_B = nn.Linear(d_model, state_size)
         self.proj_C = nn.Linear(d_model, state_size)
 
-        # Local Classification Head for Zero-Gradient Update
-        self.local_head = nn.Linear(d_model, vocab_size)
+        # --- FFN (Feed-Forward Network) Parameters ---
+        # Expansion factor of 4 is standard for LLMs
+        self.ffn_up = nn.Linear(d_model, d_model * 4)
+        self.ffn_down = nn.Linear(d_model * 4, d_model)
+
+        # --- Local Classification Head (Weight Tied) ---
+        # We share the global embedding weight for classification to save 200M params per layer
+        self.tied_embedding_weight = tied_embedding_weight
+        self.local_bias = nn.Parameter(torch.zeros(vocab_size))
+
         self.learning_rate = 1e-5
 
     def forward_ssm(self, x):
@@ -124,7 +133,15 @@ class LocalSelectiveSSMLayer(nn.Module):
             y_t = torch.sum(h * C_t.unsqueeze(1), dim=-1) + x_t * self.D
             y_out.append(y_t)
 
-        return torch.stack(y_out, dim=1)
+        ssm_out = torch.stack(y_out, dim=1)
+
+        # Standard Residual + FFN
+        ffn_out = self.ffn_down(F.silu(self.ffn_up(ssm_out)))
+        return ssm_out + ffn_out
+
+    def local_predict(self, y):
+        # Tied weight projection: y @ W.T + b
+        return F.linear(y, self.tied_embedding_weight, self.local_bias)
 
 class ZeroGradientSSM4B(nn.Module):
     def __init__(self, vocab_size=1024, d_model=128, num_layers=4):
@@ -132,7 +149,7 @@ class ZeroGradientSSM4B(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([
-            LocalSelectiveSSMLayer(d_model, vocab_size) for _ in range(num_layers)
+            LocalSelectiveSSMLayer(d_model, vocab_size, self.embed.weight) for _ in range(num_layers)
         ])
 
     def count_parameters(self):
@@ -158,6 +175,9 @@ class ZeroGradientSSM4B(nn.Module):
             layer_total = 0
             for name, param in layer.named_parameters():
                 if param.requires_grad:
+                    # Do not double-count the tied embedding weight in the per-layer summary
+                    if name == "tied_embedding_weight":
+                        continue
                     p_count = param.numel()
                     shape_str = str(list(param.shape))
                     print(f"{'  -> ' + name:<40} | {shape_str:<15} | {p_count:,}")
@@ -197,8 +217,8 @@ def local_greedy_update(layer, x_in, targets):
     # 2. Forward pass through the specific SSM layer
     y = layer.forward_ssm(x)
 
-    # 3. Predict targets using the layer's local head
-    logits = layer.local_head(y.view(-1, layer.d_model))
+    # 3. Predict targets using the layer's local weight-tied head
+    logits = layer.local_predict(y.view(-1, layer.d_model))
     flat_targets = targets.view(-1)
 
     # 4. Calculate local CrossEntropy loss
