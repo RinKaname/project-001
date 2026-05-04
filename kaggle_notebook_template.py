@@ -39,6 +39,18 @@ set_deterministic_environment(42)
 # from datasets import load_dataset
 
 print("Initializing Data Ingestion Pipeline...")
+
+class ByteTokenizer:
+    """
+    A strictly zero-asset tokenizer that encodes raw strings to UTF-8 bytes.
+    Ensures compliance with the 'Zero Pretrained Assets' rule.
+    """
+    def encode(self, text: str) -> torch.Tensor:
+        return torch.tensor(list(text.encode("utf-8", errors="replace")), dtype=torch.long)
+
+    def decode(self, tokens: torch.Tensor) -> str:
+        return bytes(tokens.tolist()).decode("utf-8", errors="replace")
+
 print("Target Dataset: togethercomputer/RedPajama-Data-1T (Sample)")
 
 # In actual Kaggle execution, this would be:
@@ -50,18 +62,27 @@ print("Target Dataset: togethercomputer/RedPajama-Data-1T (Sample)")
 # We mock the dataloader for this structural template.
 
 class MockDataloader:
-    def __init__(self, vocab_size, seq_len, batch_size):
-        self.vocab_size = vocab_size
+    def __init__(self, tokenizer, seq_len, batch_size):
+        self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
+        self.vocab_size = 256 # Fixed to UTF-8 Byte limits
+
+        # Mock dataset corpus
+        self.corpus = "The Post-Backprop Challenge aims to revolutionize efficient edge AI. " * 100
+        self.encoded_corpus = self.tokenizer.encode(self.corpus)
 
     def get_batch(self):
-        # Generates a random integer tensor simulating tokenized text
-        return torch.randint(0, self.vocab_size, (self.batch_size, self.seq_len))
+        # Simulate drawing contiguous token sequences from the corpus
+        max_start = len(self.encoded_corpus) - self.seq_len - 1
+        starts = torch.randint(0, max_start, (self.batch_size,))
+        batch = torch.stack([self.encoded_corpus[start : start + self.seq_len] for start in starts])
+        return batch
 
-# Initialize mock dataloader
-dataloader = MockDataloader(vocab_size=1024, seq_len=128, batch_size=4)
-print("Data ingestion ready.")
+# Initialize tokenizer and mock dataloader
+tokenizer = ByteTokenizer()
+dataloader = MockDataloader(tokenizer, seq_len=128, batch_size=4)
+print("Data ingestion and Tokenization ready.")
 
 # %% [markdown]
 # ## Cell 3: Zero-Base Initialization
@@ -168,7 +189,7 @@ class LocalSelectiveSSMLayer(nn.Module):
         return ssm_out + moe_out
 
 class ZeroGradientSSM4B(nn.Module):
-    def __init__(self, vocab_size=1024, d_model=128, num_layers=4):
+    def __init__(self, vocab_size=256, d_model=128, num_layers=4):
         # In reality, d_model=4096 and num_layers=32 would reach ~4B parameters
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model)
