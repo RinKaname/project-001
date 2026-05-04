@@ -101,8 +101,16 @@ $$ Y_{moe}^{(l)} = \sum_{i=1}^k g^{(l)}_{idx_i} \cdot \text{FFN}_{idx_i}(Y_{ssm}
 
 In standard architectures, the router $W_r^{(l)}$ is trained via global backpropagation from the final loss. In our zero-gradient paradigm, the router is optimized strictly via the **Local Loss Function** $\mathcal{L}^{(l)}$ defined in Section 3.
 
-Because the local prediction $\hat{p}^{(l)}_t$ is a direct function of $Y_{moe}^{(l)}$, the gradient flows cleanly backward through the selected expert $i$ and into the routing probabilities $g^{(l)}$, and subsequently into $W_r^{(l)}$:
+Because our fundamental constraint forbids the calculus-based chain rule entirely, we derive the router and expert updates utilizing the same **Hebbian Outer-Product** objective defined in Section 3.
 
-$$ \frac{\partial \mathcal{L}^{(l)}}{\partial W_r^{(l)}} = \frac{\partial \mathcal{L}^{(l)}}{\partial Y_{moe}^{(l)}} \frac{\partial Y_{moe}^{(l)}}{\partial g^{(l)}} \frac{\partial g^{(l)}}{\partial W_r^{(l)}} $$
+The positive and negative downstream error scalars ($e_{pos}$ and $e_{neg}$) drive the optimization.
+For the MoE Router $W_r^{(l)}$, the surrogate algebraic update correlates the input sequence to the desired expert projection:
 
-This allows the router to specialize experts for specific token clusters that minimize the *immediate* next-token prediction error, entirely bypassing the banned global chain rule.
+$$ \Delta W_r^{(l)} = \alpha \left( e_{pos} \cdot (X_{pos}^{(l)})^T R(X_{pos}^{(l)}) + e_{neg} \cdot (X_{neg}^{(l)})^T R(X_{neg}^{(l)}) \right) $$
+
+For a routed expert $k$ with an up-projection $W_{up,k}^{(l)}$ and down-projection $W_{down,k}^{(l)}$, the explicit inner hidden state $H_k$ is recreated during the update step to form the localized outer products:
+
+$$ \Delta W_{down,k}^{(l)} = \alpha \left( e_{pos} \cdot (H_{k, pos}^{(l)})^T Y_{pos}^{(l)} + e_{neg} \cdot (H_{k, neg}^{(l)})^T Y_{neg}^{(l)} \right) $$
+$$ \Delta W_{up,k}^{(l)} = \alpha \left( e_{pos} \cdot (X_{pos}^{(l)})^T H_{k, pos}^{(l)} + e_{neg} \cdot (X_{neg}^{(l)})^T H_{k, neg}^{(l)} \right) $$
+
+This ensures that the MoE layers expand to 4 Billion parameters and specialize for token clustering, all while rigorously satisfying the strict `torch.autograd` ban.
