@@ -72,16 +72,27 @@ print("Data ingestion ready.")
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ExpertFFN(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        # Standard expansion factor of 4
+        self.up = nn.Linear(d_model, d_model * 4)
+        self.down = nn.Linear(d_model * 4, d_model)
+
+    def forward(self, x):
+        return self.down(F.silu(self.up(x)))
+
 class LocalSelectiveSSMLayer(nn.Module):
     """
-    A single Selective SSM block coupled with an FFN block.
+    A single Selective SSM block coupled with an MoE (Mixture of Experts) block.
     Uses a tied embedding matrix for the local zero-gradient update to save VRAM.
     """
-    def __init__(self, d_model, vocab_size, tied_embedding_weight, state_size=16):
+    def __init__(self, d_model, vocab_size, tied_embedding_weight, state_size=16, num_experts=4):
         super().__init__()
         self.d_model = d_model
         self.state_size = state_size
         self.vocab_size = vocab_size
+        self.num_experts = num_experts
 
         # --- SSM Parameters ---
         self.A_log = nn.Parameter(torch.log(torch.rand(d_model, state_size) * 0.9 + 0.1))
@@ -90,10 +101,9 @@ class LocalSelectiveSSMLayer(nn.Module):
         self.proj_B = nn.Linear(d_model, state_size)
         self.proj_C = nn.Linear(d_model, state_size)
 
-        # --- FFN (Feed-Forward Network) Parameters ---
-        # Expansion factor of 4 is standard for LLMs
-        self.ffn_up = nn.Linear(d_model, d_model * 4)
-        self.ffn_down = nn.Linear(d_model * 4, d_model)
+        # --- MoE (Mixture of Experts) Parameters ---
+        self.router = nn.Linear(d_model, num_experts)
+        self.experts = nn.ModuleList([ExpertFFN(d_model) for _ in range(num_experts)])
 
         # --- Local Classification Head (Weight Tied) ---
         # We share the global embedding weight for classification to save 200M params per layer
@@ -119,8 +129,6 @@ class LocalSelectiveSSMLayer(nn.Module):
             C_t = C_matrix[:, t, :]
 
             # Clamp bar_A and bar_B to prevent exploding values
-            # Clamp bar_A and bar_B to prevent exploding values
-            # (Note: strictly keeping them bounded to avoid NaN cascades)
             # To ensure the PoC script doesn't hit NaNs with entirely random weights,
             # we tightly bound the exponential A matrix. In reality this requires careful initialization.
             bar_A = torch.exp(torch.clamp(delta_t.unsqueeze(-1) * A, max=2.0))
@@ -135,9 +143,29 @@ class LocalSelectiveSSMLayer(nn.Module):
 
         ssm_out = torch.stack(y_out, dim=1)
 
-        # Standard Residual + FFN
-        ffn_out = self.ffn_down(F.silu(self.ffn_up(ssm_out)))
-        return ssm_out + ffn_out
+        # --- MoE Routing (Top-1 for maximum speed constraint) ---
+        # Flatten batch and sequence to route individual tokens
+        flat_ssm_out = ssm_out.view(-1, D)
+        router_logits = self.router(flat_ssm_out)
+        routing_weights = F.softmax(router_logits, dim=1)
+
+        # Select top 1 expert per token
+        top1_weights, top1_indices = torch.max(routing_weights, dim=1)
+
+        moe_out = torch.zeros_like(flat_ssm_out)
+        for i, expert in enumerate(self.experts):
+            # Find tokens assigned to this expert
+            token_mask = (top1_indices == i)
+            if token_mask.any():
+                expert_inputs = flat_ssm_out[token_mask]
+                # Multiply by routing weight so gradients flow back to the router!
+                expert_outputs = expert(expert_inputs) * top1_weights[token_mask].unsqueeze(1)
+                moe_out[token_mask] = expert_outputs
+
+        moe_out = moe_out.view(B_batch, L, D)
+
+        # Standard Residual
+        return ssm_out + moe_out
 
     def local_predict(self, y):
         # Tied weight projection: y @ W.T + b
@@ -231,12 +259,15 @@ def local_greedy_update(layer, x_in, targets):
             p.grad.zero_()
 
     # Calculate gradients ONLY for this layer based on local loss
-    grads = torch.autograd.grad(local_loss, layer_params, retain_graph=False)
+    # Set allow_unused=True because MoE routing means some experts might not get tokens in a specific batch,
+    # so their parameters won't be part of the computational graph for that step.
+    grads = torch.autograd.grad(local_loss, layer_params, retain_graph=False, allow_unused=True)
 
     # Apply manual SGD update
     with torch.no_grad():
         for param, grad in zip(layer_params, grads):
-            param.sub_(layer.learning_rate * grad)
+            if grad is not None:
+                param.sub_(layer.learning_rate * grad)
 
     # Return the detached output to feed the next layer safely
     return y.detach(), local_loss.item()

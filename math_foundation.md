@@ -76,4 +76,31 @@ Because the global loss signal from layer $l+1$ is never calculated or transmitt
 3.  **Instant Update:** Layer $l$'s parameters (including its SSM matrices $A, B, C$) are updated via raw tensor operations using this local error.
 4.  **Detach and Forward:** The output $Y^{(l)}$ is mathematically detached (`.detach()` in PyTorch terminology) to destroy the computation graph, and passed as input to layer $l+1$.
 
-By discarding the computation graph after every single layer, memory consumption $O(1)$ with respect to network depth, easily satisfying the 50% peak VRAM reduction constraint and enabling massive throughput.
+By discarding the computation graph after every single layer, memory consumption is $\mathcal{O}(1)$ with respect to network depth, easily satisfying the 50% peak VRAM reduction constraint and enabling massive throughput.
+
+## 4. Scaling Efficiency: Zero-Gradient Mixture of Experts (MoE)
+
+To meet the 4 Billion parameter architectural requirement while strictly adhering to the 180-minute training limit on a T4 GPU, we augment the SSM architecture with a locally-trained Mixture of Experts (MoE) mechanism. This decouples parameter count from active computational FLOPs.
+
+### Local Routing Mechanism
+
+For layer $l$, the output of the SSM block $Y_{ssm}^{(l)}$ is passed to a router network $R^{(l)}$:
+
+$$ \text{logits}^{(l)} = Y_{ssm}^{(l)} \cdot W_r^{(l)} $$
+$$ g^{(l)} = \text{Softmax}(\text{logits}^{(l)}) $$
+
+Where $W_r^{(l)}$ is the router projection matrix, and $g^{(l)} \in \mathbb{R}^E$ represents the routing probabilities across $E$ experts. We select the top-$k$ experts (e.g., $k=1$ for maximum speed).
+
+The output of the MoE layer is the weighted sum of the selected experts' Feed-Forward Networks (FFN):
+
+$$ Y_{moe}^{(l)} = \sum_{i=1}^k g^{(l)}_{idx_i} \cdot \text{FFN}_{idx_i}(Y_{ssm}^{(l)}) $$
+
+### Localized Router Optimization
+
+In standard architectures, the router $W_r^{(l)}$ is trained via global backpropagation from the final loss. In our zero-gradient paradigm, the router is optimized strictly via the **Local Loss Function** $\mathcal{L}^{(l)}$ defined in Section 3.
+
+Because the local prediction $\hat{p}^{(l)}_t$ is a direct function of $Y_{moe}^{(l)}$, the gradient flows cleanly backward through the selected expert $i$ and into the routing probabilities $g^{(l)}$, and subsequently into $W_r^{(l)}$:
+
+$$ \frac{\partial \mathcal{L}^{(l)}}{\partial W_r^{(l)}} = \frac{\partial \mathcal{L}^{(l)}}{\partial Y_{moe}^{(l)}} \frac{\partial Y_{moe}^{(l)}}{\partial g^{(l)}} \frac{\partial g^{(l)}}{\partial W_r^{(l)}} $$
+
+This allows the router to specialize experts for specific token clusters that minimize the *immediate* next-token prediction error, entirely bypassing the banned global chain rule.
