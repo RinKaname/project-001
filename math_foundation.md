@@ -39,41 +39,70 @@ $$ \frac{\partial \mathcal{L}}{\partial W^{(l)}} = \frac{\partial \mathcal{L}}{\
 
 **This exact mathematical formulation is banned.** It requires storing the activation graph of the entire network in memory, violating both the hackathon rules and the core principles of biological plausibility.
 
-## 3. The Solution: Local Greedy Layer-Wise Learning
+## 3. The Solution: The Forward-Forward Algorithm
 
-To bypass Backpropagation Through Time, we mathematically sever the dependency between layers during the weight update phase.
+To strictly adhere to the "Zero Existing Optimizers" and "Zero torch.autograd" rules, we completely abandon automatic differentiation. We mathematically sever the dependency between layers using a Hebbian-inspired learning rule known as the **Forward-Forward (FF)** algorithm.
 
-### Local Objective Definition
-For any arbitrary layer $l$, its output is $Y^{(l)}$. We introduce a local projection matrix $P^{(l)}$ attached *only* to this layer. This projection attempts to map the intermediate layer's representation directly to the vocabulary space to predict the next token.
+### The Goodness Objective
+Instead of minimizing a Cross-Entropy loss via gradients, we train each layer to classify data as either "Real" (Positive) or "Corrupted" (Negative).
 
-The local prediction at layer $l$, time $t$ is:
-$$ \hat{p}^{(l)}_t = \text{Softmax}(P^{(l)} Y^{(l)}_t) $$
+For any arbitrary layer $l$, receiving input $X^{(l)}$, its output is $Y^{(l)}$. We define the "Goodness" $\mathcal{G}$ of the layer as the sum of squared activations:
 
-We define a purely **Local Loss Function** $\mathcal{L}^{(l)}$ for layer $l$:
-$$ \mathcal{L}^{(l)} = - \sum_c T_{t,c} \log(\hat{p}^{(l)}_{t,c}) $$
-*(where $T_t$ is the one-hot encoded target token for the next step).*
+$$ \mathcal{G}(Y^{(l)}) = \sum_{j} (Y^{(l)}_j)^2 $$
 
-### The Zero-Gradient Mathematical Proof
+The learning objective for layer $l$ is to push the Goodness well above a threshold $\theta$ for positive data, and well below $\theta$ for negative data. Let $\sigma$ be the logistic sigmoid function:
 
-The core of our submission rests on this proof. The parameter update $\Delta W^{(l)}$ for layer $l$ is defined strictly by the gradient of its *local* loss with respect to its own parameters:
+$$ p(\text{positive}) = \sigma(\mathcal{G}(Y_{pos}^{(l)}) - \theta) $$
+$$ p(\text{negative}) = 1 - \sigma(\mathcal{G}(Y_{neg}^{(l)}) - \theta) $$
 
-$$ \Delta W^{(l)} = - \alpha \nabla_{W^{(l)}} \mathcal{L}^{(l)} $$
+### The Raw Tensor Hebbian Update (Zero Autograd)
 
-Let us examine the dependency of layer $l$'s update on layer $l+1$:
+To optimize this objective **without utilizing the global chain rule or any automatic differentiation**, we derive the raw tensor update explicitly. The weight update $\Delta W^{(l)}$ for a linear projection within the layer is defined purely by the outer product of the inputs and the downstream error scalar:
 
-$$ \frac{\partial \mathcal{L}^{(l+1)}}{\partial W^{(l)}} = \frac{\partial \mathcal{L}^{(l+1)}}{\partial Y^{(l+1)}} \frac{\partial Y^{(l+1)}}{\partial Y^{(l)}} \frac{\partial Y^{(l)}}{\partial W^{(l)}} $$
+Let the scalar error for a positive pass be $e_{pos} = 1 - p(\text{positive})$
+Let the scalar error for a negative pass be $e_{neg} = 0 - (1 - p(\text{negative}))$
 
-However, in our localized training loop, we **do not compute or utilize** $\frac{\partial \mathcal{L}^{(l+1)}}{\partial W^{(l)}}$. The gradient calculation for $W^{(l)}$ is mathematically bounded within the scope of $\mathcal{L}^{(l)}$:
+The exact explicit weight update matrix applied to $W^{(l)}$ is calculated via pure matrix multiplication:
 
-$$ \frac{\partial \mathcal{L}^{(l)}}{\partial W^{(l)}} = \frac{\partial \mathcal{L}^{(l)}}{\partial \hat{p}^{(l)}} \frac{\partial \hat{p}^{(l)}}{\partial Y^{(l)}} \frac{\partial Y^{(l)}}{\partial W^{(l)}} $$
+$$ \Delta W^{(l)} = \alpha \left( e_{pos} \cdot (X_{pos}^{(l)})^T Y_{pos}^{(l)} + e_{neg} \cdot (X_{neg}^{(l)})^T Y_{neg}^{(l)} \right) $$
 
-Because the global loss signal from layer $l+1$ is never calculated or transmitted backward, we guarantee mathematically that:
-**The error signal from layer $l+1$ has a coefficient of 0 in the update of layer $l$.**
+**The Mathematical Guarantee:**
+1. The update $\Delta W^{(l)}$ relies exclusively on $X^{(l)}$ (the input to the layer) and $Y^{(l)}$ (the output of the layer).
+2. The term $\frac{\partial Y^{(l+1)}}{\partial Y^{(l)}}$ (the backward error signal from the next layer) does not exist in the formulation.
+3. The calculation is executed using primitive `torch.matmul` operations, bypassing `torch.autograd` completely and satisfying the strictest constraints of the Post-Backprop Challenge.
 
 ### Practical Execution (The 3-Hour Constraint)
-1.  **Forward Pass:** A batch of tokens moves through layer $l$.
-2.  **Local Evaluation:** Layer $l$ produces output $Y^{(l)}$, predicts the target via $P^{(l)}$, and computes local error.
-3.  **Instant Update:** Layer $l$'s parameters (including its SSM matrices $A, B, C$) are updated via raw tensor operations using this local error.
-4.  **Detach and Forward:** The output $Y^{(l)}$ is mathematically detached (`.detach()` in PyTorch terminology) to destroy the computation graph, and passed as input to layer $l+1$.
+1.  **Generate Negatives:** We generate $X_{neg}$ by randomly permuting the token sequences of the real batch $X_{pos}$.
+2.  **Forward Pass 1:** $X_{pos}$ moves through layer $l$. We compute Goodness and $e_{pos}$.
+3.  **Forward Pass 2:** $X_{neg}$ moves through layer $l$. We compute Goodness and $e_{neg}$.
+4.  **Raw Tensor Update:** We compute $\Delta W^{(l)}$ using primitive matrix operations and subtract it directly from the layer's parameters.
+5.  **Detach and Forward:** The normalized positive output $Y_{pos}^{(l)}$ is mathematically detached to destroy the computation graph, and passed as input to layer $l+1$.
 
-By discarding the computation graph after every single layer, memory consumption $O(1)$ with respect to network depth, easily satisfying the 50% peak VRAM reduction constraint and enabling massive throughput.
+By discarding the computation graph after every single layer, memory consumption is $\mathcal{O}(1)$ with respect to network depth, easily satisfying the 50% peak VRAM reduction constraint and enabling massive throughput.
+
+## 4. Scaling Efficiency: Zero-Gradient Mixture of Experts (MoE)
+
+To meet the 4 Billion parameter architectural requirement while strictly adhering to the 180-minute training limit on a T4 GPU, we augment the SSM architecture with a locally-trained Mixture of Experts (MoE) mechanism. This decouples parameter count from active computational FLOPs.
+
+### Local Routing Mechanism
+
+For layer $l$, the output of the SSM block $Y_{ssm}^{(l)}$ is passed to a router network $R^{(l)}$:
+
+$$ \text{logits}^{(l)} = Y_{ssm}^{(l)} \cdot W_r^{(l)} $$
+$$ g^{(l)} = \text{Softmax}(\text{logits}^{(l)}) $$
+
+Where $W_r^{(l)}$ is the router projection matrix, and $g^{(l)} \in \mathbb{R}^E$ represents the routing probabilities across $E$ experts. We select the top-$k$ experts (e.g., $k=1$ for maximum speed).
+
+The output of the MoE layer is the weighted sum of the selected experts' Feed-Forward Networks (FFN):
+
+$$ Y_{moe}^{(l)} = \sum_{i=1}^k g^{(l)}_{idx_i} \cdot \text{FFN}_{idx_i}(Y_{ssm}^{(l)}) $$
+
+### Localized Router Optimization
+
+In standard architectures, the router $W_r^{(l)}$ is trained via global backpropagation from the final loss. In our zero-gradient paradigm, the router is optimized strictly via the **Local Loss Function** $\mathcal{L}^{(l)}$ defined in Section 3.
+
+Because the local prediction $\hat{p}^{(l)}_t$ is a direct function of $Y_{moe}^{(l)}$, the gradient flows cleanly backward through the selected expert $i$ and into the routing probabilities $g^{(l)}$, and subsequently into $W_r^{(l)}$:
+
+$$ \frac{\partial \mathcal{L}^{(l)}}{\partial W_r^{(l)}} = \frac{\partial \mathcal{L}^{(l)}}{\partial Y_{moe}^{(l)}} \frac{\partial Y_{moe}^{(l)}}{\partial g^{(l)}} \frac{\partial g^{(l)}}{\partial W_r^{(l)}} $$
+
+This allows the router to specialize experts for specific token clusters that minimize the *immediate* next-token prediction error, entirely bypassing the banned global chain rule.
