@@ -39,6 +39,18 @@ set_deterministic_environment(42)
 # from datasets import load_dataset
 
 print("Initializing Data Ingestion Pipeline...")
+
+class ByteTokenizer:
+    """
+    A strictly zero-asset tokenizer that encodes raw strings to UTF-8 bytes.
+    Ensures compliance with the 'Zero Pretrained Assets' rule.
+    """
+    def encode(self, text: str) -> torch.Tensor:
+        return torch.tensor(list(text.encode("utf-8", errors="replace")), dtype=torch.long)
+
+    def decode(self, tokens: torch.Tensor) -> str:
+        return bytes(tokens.tolist()).decode("utf-8", errors="replace")
+
 print("Target Dataset: togethercomputer/RedPajama-Data-1T (Sample)")
 
 # In actual Kaggle execution, this would be:
@@ -50,18 +62,27 @@ print("Target Dataset: togethercomputer/RedPajama-Data-1T (Sample)")
 # We mock the dataloader for this structural template.
 
 class MockDataloader:
-    def __init__(self, vocab_size, seq_len, batch_size):
-        self.vocab_size = vocab_size
+    def __init__(self, tokenizer, seq_len, batch_size):
+        self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.batch_size = batch_size
+        self.vocab_size = 256 # Fixed to UTF-8 Byte limits
+
+        # Mock dataset corpus
+        self.corpus = "The Post-Backprop Challenge aims to revolutionize efficient edge AI. " * 100
+        self.encoded_corpus = self.tokenizer.encode(self.corpus)
 
     def get_batch(self):
-        # Generates a random integer tensor simulating tokenized text
-        return torch.randint(0, self.vocab_size, (self.batch_size, self.seq_len))
+        # Simulate drawing contiguous token sequences from the corpus
+        max_start = len(self.encoded_corpus) - self.seq_len - 1
+        starts = torch.randint(0, max_start, (self.batch_size,))
+        batch = torch.stack([self.encoded_corpus[start : start + self.seq_len] for start in starts])
+        return batch
 
-# Initialize mock dataloader
-dataloader = MockDataloader(vocab_size=1024, seq_len=128, batch_size=4)
-print("Data ingestion ready.")
+# Initialize tokenizer and mock dataloader
+tokenizer = ByteTokenizer()
+dataloader = MockDataloader(tokenizer, seq_len=128, batch_size=4)
+print("Data ingestion and Tokenization ready.")
 
 # %% [markdown]
 # ## Cell 3: Zero-Base Initialization
@@ -168,13 +189,22 @@ class LocalSelectiveSSMLayer(nn.Module):
         return ssm_out + moe_out
 
 class ZeroGradientSSM4B(nn.Module):
-    def __init__(self, vocab_size=1024, d_model=128, num_layers=4):
+    def __init__(self, vocab_size=256, d_model=128, num_layers=4):
         # In reality, d_model=4096 and num_layers=32 would reach ~4B parameters
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([
             LocalSelectiveSSMLayer(d_model, vocab_size, self.embed.weight) for _ in range(num_layers)
         ])
+
+    def forward(self, x):
+        """Standard full forward pass for inference/benchmarking"""
+        h = self.embed(x)
+        for layer in self.layers:
+            h = layer.forward_ssm(h)
+        # Tied LM Head: Project back to vocab using embedding weights
+        logits = F.linear(h, self.embed.weight)
+        return logits
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -274,13 +304,50 @@ def local_forward_forward_update(layer, x_pos, x_neg):
         # Matmul computes the outer product sum over the batch
         delta_W = torch.matmul(scaled_x_pos.t(), y_pos_flat) + torch.matmul(scaled_x_neg.t(), y_neg_flat)
 
-        # Apply the update manually to all major projection layers
-        # In a full rigorous implementation, Delta W would be computed perfectly per-matrix.
-        # Here we apply the core Hebbian update to the main routing and proj_delta blocks
-        # to mathematically prove we do not rely on autograd.
-        layer.router.weight.add_(layer.learning_rate * delta_W[:layer.num_experts, :])
+        # Explicit Forward-Forward Update for SSM and MoE parameters
+        # In standard backpropagation, delta_W propagates through the entire graph.
+        # Here we calculate surrogate algebraic updates using localized input-output outer products.
+
+        # 1. Update Core SSM Parameters (e.g., proj_delta)
         layer.proj_delta.weight.add_(layer.learning_rate * delta_W)
         layer.proj_delta.bias.add_(layer.learning_rate * torch.mean(delta_W, dim=1))
+
+        # We perform similar outer products for the state matrices
+        delta_B = torch.matmul(scaled_x_pos.t(), layer.proj_B(x_pos_flat)) + \
+                  torch.matmul(scaled_x_neg.t(), layer.proj_B(x_neg_flat))
+        layer.proj_B.weight.add_(layer.learning_rate * delta_B.t())
+
+        delta_C = torch.matmul(scaled_x_pos.t(), layer.proj_C(x_pos_flat)) + \
+                  torch.matmul(scaled_x_neg.t(), layer.proj_C(x_neg_flat))
+        layer.proj_C.weight.add_(layer.learning_rate * delta_C.t())
+
+        # 2. Update the Router
+        # The router uses the flat SSM output (not the layer input)
+        # We simulate the router's local Hebbian update
+        ssm_out_pos = layer.forward_ssm(x_pos).view(-1, layer.d_model)
+        ssm_out_neg = layer.forward_ssm(x_neg).view(-1, layer.d_model)
+
+        router_grad = torch.matmul((ssm_out_pos * e_pos.unsqueeze(1)).t(), layer.router(ssm_out_pos)) + \
+                      torch.matmul((ssm_out_neg * e_neg.unsqueeze(1)).t(), layer.router(ssm_out_neg))
+        layer.router.weight.add_(layer.learning_rate * router_grad.t())
+
+        # 3. Update the MoE Experts
+        # We iterate over the experts and calculate the Hebbian outer product specifically
+        # for their inputs (the routed ssm_out) and their internal hidden states.
+        for i, expert in enumerate(layer.experts):
+            # To isolate inputs for expert i, we approximate by passing the full state.
+            # In a sparse implementation, this would be masked.
+            hidden_pos = F.silu(expert.up(ssm_out_pos))
+            hidden_neg = F.silu(expert.up(ssm_out_neg))
+
+            grad_up = torch.matmul((ssm_out_pos * e_pos.unsqueeze(1)).t(), hidden_pos) + \
+                      torch.matmul((ssm_out_neg * e_neg.unsqueeze(1)).t(), hidden_neg)
+
+            grad_down = torch.matmul((hidden_pos * e_pos.unsqueeze(1)).t(), y_pos_flat) + \
+                        torch.matmul((hidden_neg * e_neg.unsqueeze(1)).t(), y_neg_flat)
+
+            expert.up.weight.add_(layer.learning_rate * grad_up.t())
+            expert.down.weight.add_(layer.learning_rate * grad_down.t())
 
         # Calculate a pseudo-loss for printing (Goodness distance)
         pseudo_loss = torch.mean(torch.log(1 + torch.exp(-(g_pos - layer.threshold)))) + \
