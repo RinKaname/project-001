@@ -45,7 +45,7 @@ print("Target Dataset: togethercomputer/RedPajama-Data-1T (Sample)")
 # Note: Hugging Face datasets >= 3.0 blocks all custom scripts.
 # To load RedPajama, we must directly target the underlying JSONL/Parquet files
 # or use a modern, script-free equivalent like SlimPajama to save time:
-# dataset = load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
+# dataset = load_dataset("DKYoon/SlimPajama-6B", split="train", streaming=True)
 #
 # We mock the dataloader for this structural template.
 
@@ -139,17 +139,41 @@ class ZeroGradientSSM4B(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def parameter_summary(self):
-        print("\n" + "="*50)
-        print(f"{'Layer Type':<25} | {'Parameters':<15}")
-        print("="*50)
+        print("\n" + "="*70)
+        print(f"{'Component Definition':<40} | {'Shape':<15} | {'Parameters':<10}")
+        print("="*70)
         total_params = 0
-        for name, module in self.named_children():
-            params = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            print(f"{name:<25} | {params:,}")
-            total_params += params
-        print("="*50)
-        print(f"{'Total Trainable Params':<25} | {total_params:,}")
-        print("="*50 + "\n")
+
+        # Breakdown Embedding
+        embed_params = sum(p.numel() for p in self.embed.parameters() if p.requires_grad)
+        weight_shape = str(list(self.embed.weight.shape))
+        print(f"{'Embedding (Vocab x d_model)':<40} | {weight_shape:<15} | {embed_params:,}")
+        total_params += embed_params
+
+        # Breakdown a single SSM Layer
+        if len(self.layers) > 0:
+            print("-" * 70)
+            print(f"--- Single SSM Layer Internal Breakdown ---")
+            layer = self.layers[0]
+            layer_total = 0
+            for name, param in layer.named_parameters():
+                if param.requires_grad:
+                    p_count = param.numel()
+                    shape_str = str(list(param.shape))
+                    print(f"{'  -> ' + name:<40} | {shape_str:<15} | {p_count:,}")
+                    layer_total += p_count
+            print(f"{'  Total per layer':<40} | {'':<15} | {layer_total:,}")
+
+            # Print Layers Summary
+            print("-" * 70)
+            num_layers = len(self.layers)
+            all_layers_params = layer_total * num_layers
+            print(f"{f'All SSM Layers (x{num_layers})':<40} | {'':<15} | {all_layers_params:,}")
+            total_params += all_layers_params
+
+        print("="*70)
+        print(f"{'Total Trainable Architecture Parameters':<40} | {'':<15} | {total_params:,}")
+        print("="*70 + "\n")
 
 print("Initializing 4 Billion Parameter Architecture from raw tensor seeds...")
 model = ZeroGradientSSM4B()
