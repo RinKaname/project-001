@@ -126,9 +126,12 @@ class LocalSelectiveSSMLayer(nn.Module):
         self.router = nn.Linear(d_model, num_experts)
         self.experts = nn.ModuleList([ExpertFFN(d_model) for _ in range(num_experts)])
 
+        # --- Stability Norms ---
+        self.norm = nn.LayerNorm(d_model)
+
         # --- Threshold for Forward-Forward ---
         self.threshold = 2.0
-        self.learning_rate = 1e-5
+        self.learning_rate = 1e-6
 
     def forward_ssm(self, x):
         B_batch, L, D = x.shape
@@ -182,11 +185,9 @@ class LocalSelectiveSSMLayer(nn.Module):
 
         moe_out = moe_out.view(B_batch, L, D)
 
-        # Normalize activations for Forward-Forward stability
-        moe_out = F.normalize(moe_out, p=2, dim=-1)
-
-        # Standard Residual
-        return ssm_out + moe_out
+        # Standard Residual + LayerNorm for severe NaN stability
+        out = ssm_out + moe_out
+        return self.norm(out)
 
 class ZeroGradientSSM4B(nn.Module):
     def __init__(self, vocab_size=256, d_model=128, num_layers=4):
@@ -296,13 +297,22 @@ def local_forward_forward_update(layer, x_pos, x_neg):
         # This approximates the update for all projection layers using pure matmul
         # Delta W = alpha * ( e_pos * X_pos^T * Y_pos + e_neg * X_neg^T * Y_neg )
 
+        # Normalize vectors prior to outer product to prevent exploding gradients (NaNs)
+        x_pos_flat_norm = F.normalize(x_pos_flat, p=2, dim=-1)
+        x_neg_flat_norm = F.normalize(x_neg_flat, p=2, dim=-1)
+        y_pos_flat_norm = F.normalize(y_pos_flat, p=2, dim=-1)
+        y_neg_flat_norm = F.normalize(y_neg_flat, p=2, dim=-1)
+
         # Compute the explicit gradient matrices (shape: d_model x d_model)
         # We scale inputs by the error scalar first
-        scaled_x_pos = x_pos_flat * e_pos.unsqueeze(1)
-        scaled_x_neg = x_neg_flat * e_neg.unsqueeze(1)
+        scaled_x_pos = x_pos_flat_norm * e_pos.unsqueeze(1)
+        scaled_x_neg = x_neg_flat_norm * e_neg.unsqueeze(1)
 
         # Matmul computes the outer product sum over the batch
-        delta_W = torch.matmul(scaled_x_pos.t(), y_pos_flat) + torch.matmul(scaled_x_neg.t(), y_neg_flat)
+        delta_W = torch.matmul(scaled_x_pos.t(), y_pos_flat_norm) + torch.matmul(scaled_x_neg.t(), y_neg_flat_norm)
+
+        # Clamp the global update tensor to prevent numeric overflow
+        delta_W = torch.clamp(delta_W, min=-1.0, max=1.0)
 
         # Explicit Forward-Forward Update for SSM and MoE parameters
         # In standard backpropagation, delta_W propagates through the entire graph.
@@ -350,8 +360,12 @@ def local_forward_forward_update(layer, x_pos, x_neg):
             expert.down.weight.add_(layer.learning_rate * grad_down.t())
 
         # Calculate a pseudo-loss for printing (Goodness distance)
-        pseudo_loss = torch.mean(torch.log(1 + torch.exp(-(g_pos - layer.threshold)))) + \
-                      torch.mean(torch.log(1 + torch.exp(g_neg - layer.threshold)))
+        # Using clamps to ensure the exponential doesn't hit inf for logging
+        clamped_g_pos = torch.clamp(g_pos - layer.threshold, min=-20.0, max=20.0)
+        clamped_g_neg = torch.clamp(g_neg - layer.threshold, min=-20.0, max=20.0)
+
+        pseudo_loss = torch.mean(torch.log(1 + torch.exp(-clamped_g_pos))) + \
+                      torch.mean(torch.log(1 + torch.exp(clamped_g_neg)))
 
     # Return detached positive output to feed the next layer
     return y_pos.detach(), pseudo_loss.item()
