@@ -443,7 +443,7 @@ def local_readout_update(model, final_state, target_tokens):
         residual = target - pred
 
         # Hebbian outer product for the linear layer
-        grad_w = torch.matmul(residual.t(), final_state)
+        grad_w = torch.matmul(residual.t().to(dtype=final_state.dtype), final_state)
         grad_b = residual.sum(dim=0)
 
         model.embed.weight.add_((0.01 / max(1, final_state.shape[0])) * grad_w)
