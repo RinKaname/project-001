@@ -136,7 +136,7 @@ class LocalSelectiveSSMLayer(nn.Module):
         B_matrix = self.proj_B(x)
         C_matrix = self.proj_C(x)
 
-        h = torch.zeros(B_batch, D, self.state_size, device=x.device)
+        h = torch.zeros(B_batch, D, self.state_size, device=x.device, dtype=x.dtype)
         A = -torch.exp(self.A_log)
 
         y_out = []
