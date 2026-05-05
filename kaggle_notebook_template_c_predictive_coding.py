@@ -27,6 +27,24 @@ import torch.nn.functional as F
 import math
 import time
 from typing import List, Tuple, Dict
+import os
+
+# Try to import real datasets; fallback to simple text loading if unavailable
+try:
+    from datasets import load_dataset
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+    print("Warning: 'datasets' library not found. Install with: pip install datasets")
+
+try:
+    from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+    HAS_TOKENIZERS = True
+except ImportError:
+    HAS_TOKENIZERS = False
+    print("Warning: 'tokenizers' library not found. Install with: pip install tokenizers")
+
+print(f"Environment Check: Datasets={HAS_DATASETS}, Tokenizers={HAS_TOKENIZERS}")
 
 # Configuration
 CONFIG = {
@@ -308,21 +326,63 @@ class PredictiveCodingNetwork(nn.Module):
         
         return loss, total_pc_loss / len(self.pc_layers)
 
+    def generate_step(self, input_ids):
+        """
+        Generate logits for next token prediction (used during inference).
+        This method bypasses the PC learning dynamics and just does a standard forward pass.
+        """
+        # Get embeddings
+        x = self.embedding(input_ids)
+        
+        # Standard forward pass through layers (no iterative inference for speed)
+        h = x
+        hidden_states = [h]
+        
+        for pc_layer in self.pc_layers:
+            # Use generative weights in reverse or learn separate inference weights
+            # For simplicity, we use W^T as inference mapping (common approximation)
+            if pc_layer.use_moe:
+                # MoE inference path
+                gate_logits = pc_layer.gate(h)
+                top_k_logits, top_k_indices = torch.topk(gate_logits, pc_layer.top_k, dim=-1)
+                gate_weights = F.softmax(top_k_logits, dim=-1)
+                
+                expert_outputs = torch.stack([expert(h) for expert in pc_layer.experts], dim=1)
+                selected_experts = torch.gather(expert_outputs, 1, 
+                                              top_k_indices.unsqueeze(-1).expand(-1, -1, pc_layer.input_dim))
+                h = torch.sum(selected_experts * gate_weights.unsqueeze(-1), dim=1) + pc_layer.bias
+            else:
+                # Simple linear projection (using W transpose for inference)
+                h = F.linear(h, pc_layer.W.t())
+            
+            h = F.gelu(h)
+            hidden_states.append(h)
+        
+        # Output projection
+        logits = self.output_proj(h)
+        return logits
+
 def generate_text(model, tokenizer, prompt, max_length=50, temperature=0.8):
     """Generate text using the trained model."""
     model.eval()
+    
+    if tokenizer is None:
+        print("Cannot generate text without a real tokenizer.")
+        return prompt + " [Mock generation not available]"
+    
     inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.config["device"])
     
     generated = inputs
     with torch.no_grad():
         for _ in range(max_length):
-            outputs = model(generated)
-            # Note: Our model returns (loss, pc_loss), we need logits
-            # Modify forward to return logits during eval or handle differently
-            # For simplicity in this template, we assume a separate eval method or modify forward
-            # Here we just break as full generation logic requires adjusting forward for eval mode
-            break
-            
+            # In eval mode, we need logits, not loss
+            # We'll modify forward to handle this or use a separate method
+            outputs = model.generate_step(generated)
+            next_token_logits = outputs[:, -1, :] / temperature
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token], dim=1)
+    
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 def count_parameters(model):
@@ -332,11 +392,9 @@ def main():
     print(f"Running Predictive Coding Template (Candidate C)")
     print(f"Device: {CONFIG['device']}")
     
-    # Mock tokenizer/data for demonstration
-    # In real scenario, load wikitext-2 or similar
-    vocab_size = CONFIG["vocab_size"]
-    seq_len = CONFIG["seq_len"]
-    batch_size = CONFIG["batch_size"]
+    # Load real data if possible
+    text_data = load_real_dataset(CONFIG)
+    tokenizer = create_tokenizer(text_data, CONFIG["vocab_size"])
     
     model = PredictiveCodingNetwork(CONFIG).to(CONFIG["device"])
     
@@ -344,13 +402,18 @@ def main():
     print(f"Total Parameters: {total_params / 1e6:.2f}M")
     print(f"Target: ~4000M (Adjust layers/dim to scale up)")
     
-    # Mock data loop
+    # Get data loader
+    data_loader = get_data_loader(tokenizer, text_data, CONFIG)
+    
+    # Training loop
     model.train()
     start_time = time.time()
     
-    for step in range(CONFIG["max_steps"]):
-        # Generate random mock data
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(CONFIG["device"])
+    for step, batch in enumerate(data_loader):
+        if step >= CONFIG["max_steps"]:
+            break
+            
+        input_ids = batch[0].to(CONFIG["device"]) if isinstance(batch, (list, tuple)) else batch.to(CONFIG["device"])
         targets = input_ids.clone()
         
         loss, pc_loss = model(input_ids, targets)
@@ -362,6 +425,12 @@ def main():
     print("Training complete.")
     print("Note: This template implements strict Local Learning Rules via Predictive Coding.")
     print("No global error signal is propagated backwards through the network layers.")
+    
+    # Optional: Generate sample text if tokenizer is available
+    if tokenizer:
+        print("\nGenerating sample text...")
+        sample = generate_text(model, tokenizer, "The future of", max_length=30)
+        print(f"Generated: {sample}")
 
 if __name__ == "__main__":
     # Ensure CUDA is available or handle CPU fallback gracefully
