@@ -320,6 +320,46 @@ class PCLanguageModel:
         
         return ce_loss.item(), total_energy
 
+    def generate(self, input_ids, max_new_tokens, temperature=1.0):
+        """
+        Generates new tokens using a bottom-up forward sweep (pure prediction).
+        input_ids: [batch_size, seq_len]
+        """
+        generated_ids = input_ids.clone()
+
+        for _ in range(max_new_tokens):
+            # Crop to max_seq_len to avoid exceeding any positional bounds (though we don't use pos embeddings here, good practice)
+            cond_idx = generated_ids[:, -self.config.max_seq_len:]
+
+            # Bottom-Up Pass
+            x_0 = F.embedding(cond_idx, self.token_emb)
+            current_x = x_0
+
+            for layer in self.layers:
+                proj = torch.matmul(current_x, layer.W) + layer.b
+                current_x = layer.activation(proj)
+
+            # Get the state of the last token in the sequence
+            top_state_last = current_x[:, -1, :]
+
+            # Compute logits
+            logits = torch.matmul(top_state_last, self.lm_head.T)
+
+            # Sample next token
+            if temperature == 0.0:
+                # Greedy decoding
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                # Temperature sampling
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+            # Append to generated sequence
+            generated_ids = torch.cat((generated_ids, next_token), dim=1)
+
+        return generated_ids
+
 import time
 import os
 
@@ -393,6 +433,28 @@ def run_training():
         print(f"Training successfully completed {max_steps} steps in {elapsed:.2f}s.")
         print("Zero-gradient constraint satisfied: All weights updated via local prediction errors.")
         
+        # 5. Test Generation
+        print("\n" + "="*50)
+        print("Testing Generation Capabilities")
+        print("="*50)
+
+        prompt = "The future of Artificial Intelligence is"
+        print(f"Prompt: '{prompt}'")
+
+        prompt_tokens = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.get_device())
+
+        # Generate tokens
+        generated_tokens = model.generate(
+            input_ids=prompt_tokens,
+            max_new_tokens=20,
+            temperature=0.7 # slightly deterministic for sanity check
+        )
+
+        # Decode and print the result
+        generated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+        print(f"Generated Output:\n{generated_text}\n")
+        print("="*50)
+
 if __name__ == "__main__":
     # Disable autograd globally just to prove compliance with Hackathon rules
     torch.set_grad_enabled(False)
