@@ -82,6 +82,8 @@ class PCLayer:
         """
         # Linear projection
         proj = torch.matmul(x_higher, self.W.T) + self.b
+        # Apply LayerNorm as a numerical stability guardrail
+        proj = F.layer_norm(proj, (self.hidden_size,))
         return self.activation(proj), proj
         
     def update_weights(self, error_local, pre_act_proj, x_higher):
@@ -105,8 +107,12 @@ class PCLayer:
         local_signal_flat = local_signal.view(-1, self.hidden_size)
         x_higher_flat = x_higher.view(-1, self.hidden_size)
         
+        # Mathematical guardrail: Normalize vectors prior to Hebbian outer product to prevent NaN explosions
+        local_signal_flat_norm = F.normalize(local_signal_flat, p=2, dim=-1)
+        x_higher_flat_norm = F.normalize(x_higher_flat, p=2, dim=-1)
+
         # delta_W: [H, H]
-        delta_W = torch.matmul(local_signal_flat.T, x_higher_flat) / local_signal_flat.shape[0]
+        delta_W = torch.matmul(local_signal_flat_norm.T, x_higher_flat_norm) / local_signal_flat.shape[0]
         
         # delta_b: [H]
         delta_b = local_signal_flat.mean(dim=0)
@@ -251,8 +257,9 @@ class PCLanguageModel:
                     err_curr = states[l] - pred_curr
                     grad_top_down = err_curr # x_l is pulled toward pred_curr
                     
-                # Update state
+                # Update state (with clipping for stability)
                 total_grad = grad_bottom_up + grad_top_down
+                total_grad = torch.clamp(total_grad, -1.0, 1.0)
                 new_states[l].sub_(total_grad, alpha=self.config.eta_x)
                 
             states = new_states
@@ -337,6 +344,7 @@ class PCLanguageModel:
 
             for layer in self.layers:
                 proj = torch.matmul(current_x, layer.W) + layer.b
+                proj = F.layer_norm(proj, (layer.hidden_size,))
                 current_x = layer.activation(proj)
 
             # Get the state of the last token in the sequence
@@ -397,7 +405,7 @@ def run_training():
     with torch.no_grad():
         batch_ids = []
         step = 0
-        max_steps = 10  # Toy run limits steps
+        max_steps = 100  # Toy run limits steps (increased to test stability)
         start_time = time.time()
         
         for sample in dataset:
