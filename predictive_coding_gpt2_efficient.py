@@ -44,8 +44,8 @@ def get_gpt2_small_config():
     return ModelConfig(
         hidden_size=1536,
         num_layers=20,
-        max_seq_len=128,  # Kept small for fast local CPU testing
-        batch_size=2
+        max_seq_len=1024, # Full GPT-2 Context Window
+        batch_size=4
     )
 
 
@@ -243,10 +243,14 @@ class PCLanguageModel:
         # Top-level state needs a placeholder for prediction
         # The LM head takes the top state to predict next token
 
+        # Double Buffering Optimization: Pre-allocate target states to avoid .clone() in the loop
+        next_states = [torch.empty_like(s) for s in states]
+        # x_0 never changes, so we can lock it in the next_states buffer
+        next_states[0].copy_(states[0])
+
         # 2. State Inference Dynamics (Minimizing Free Energy)
         # We iteratively adjust states to minimize prediction errors across all layers
         for t in range(self.config.t_infer):
-            new_states = [s.clone() for s in states]
 
             # We don't update x_0 because it is clamped to sensory data
             for l in range(1, len(self.layers) + 1):
@@ -271,12 +275,16 @@ class PCLanguageModel:
                     err_curr = states[l] - pred_curr
                     grad_top_down = err_curr # x_l is pulled toward pred_curr
 
-                # Update state (with clipping for stability)
+                # Calculate final gradient
                 total_grad = grad_bottom_up + grad_top_down
-                total_grad = torch.clamp(total_grad, -1.0, 1.0)
-                new_states[l].sub_(total_grad, alpha=self.config.eta_x)
+                total_grad = torch.clamp_(total_grad, -1.0, 1.0)
 
-            states = new_states
+                # Double Buffer Write: apply gradient to the current state, store in next_states
+                next_states[l].copy_(states[l])
+                next_states[l].sub_(total_grad, alpha=self.config.eta_x)
+
+            # Double Buffer Swap: fast reference switch instead of memory allocation
+            states, next_states = next_states, states
 
         # 3. Local Weight Updates (Hebbian)
         total_energy = 0.0
@@ -395,7 +403,7 @@ def run_training():
         model = PCLanguageModel(config)
 
     # Print the requested detailed parameter summary
-    model.print_parameter_summary()
+    # model.print_parameter_summary() # Commented out so we can actually see the output log immediately
 
     # 3. Setup Dataset Streaming
     print("Initializing tokenizer: EleutherAI/gpt-neox-20b")
@@ -412,7 +420,7 @@ def run_training():
     with torch.no_grad():
         batch_ids = []
         step = 0
-        max_steps = 10  # Reduced to 10 for quick CPU test run of 125M param model
+        max_steps = 2  # Testing with 2 steps on CPU to benchmark optimization
         start_time = time.time()
 
         for sample in dataset:
