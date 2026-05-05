@@ -142,6 +142,58 @@ class PCLanguageModel:
     def get_device(self):
         return self.token_emb.device
 
+    def print_parameter_summary(self):
+        """
+        Prints a detailed granular summary of the model's parameters per layer,
+        including shapes, parameter counts, memory usage, and dtypes.
+        """
+        print("-" * 105)
+        print(f"{'Component':<25} | {'Name':<15} | {'Shape':<20} | {'Parameters':<12} | {'Memory':<10} | {'Dtype'}")
+        print("-" * 105)
+
+        total_params = 0
+        total_bytes = 0
+
+        def add_param(component, name, tensor):
+            nonlocal total_params, total_bytes
+            num_params = tensor.numel()
+            mem_bytes = num_params * tensor.element_size()
+            total_params += num_params
+            total_bytes += mem_bytes
+
+            # Format memory nicely
+            if mem_bytes >= 1024 ** 3:
+                mem_str = f"{mem_bytes / (1024**3):.2f} GB"
+            elif mem_bytes >= 1024 ** 2:
+                mem_str = f"{mem_bytes / (1024**2):.2f} MB"
+            else:
+                mem_str = f"{mem_bytes / 1024:.2f} KB"
+
+            shape_str = str(list(tensor.shape))
+            print(f"{component:<25} | {name:<15} | {shape_str:<20} | {num_params:<12,d} | {mem_str:<10} | {str(tensor.dtype).replace('torch.', '')}")
+
+        # Token Embedding
+        add_param("Token Embedding", "token_emb", self.token_emb)
+
+        # PC Layers
+        for i, layer in enumerate(self.layers):
+            comp_name = f"PCLayer {i}"
+            add_param(comp_name, "W", layer.W)
+            add_param(comp_name, "b", layer.b)
+
+        # LM Head
+        add_param("LM Head", "lm_head", self.lm_head)
+
+        print("-" * 105)
+        print(f"Total Parameters: {total_params:,}")
+
+        if total_bytes >= 1024 ** 3:
+            total_mem_str = f"{total_bytes / (1024**3):.2f} GB"
+        else:
+            total_mem_str = f"{total_bytes / (1024**2):.2f} MB"
+        print(f"Total Estimated Memory: {total_mem_str}")
+        print("-" * 105)
+
     def train_step(self, input_ids):
         """
         Executes one training step on a batch of input_ids using Predictive Coding.
@@ -287,6 +339,9 @@ def run_training():
     with torch.no_grad():
         model = PCLanguageModel(config)
     
+    # Print the requested detailed parameter summary
+    model.print_parameter_summary()
+
     # 3. Setup Dataset Streaming
     print("Initializing tokenizer: EleutherAI/gpt-neox-20b")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
