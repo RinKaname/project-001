@@ -109,6 +109,9 @@ class PCFinanceModel:
                 next_states[l].copy_(states[l])
                 next_states[l].sub_(total_grad, alpha=self.eta_x)
 
+                # Biological Guardrail: Normalize the states to prevent continuous activation explosions
+                next_states[l] = F.normalize(next_states[l], p=2, dim=-1)
+
             states, next_states = next_states, states
 
         # 3. Local Weight Updates
@@ -135,12 +138,22 @@ class PCFinanceModel:
         # d_loss/d_pred = 2 * (pred - target)
         grad_pred = 2.0 * error / B
 
+        # Biological Guardrail: Clip the error gradient to prevent massive output explosions
+        grad_pred = torch.clamp(grad_pred, -1.0, 1.0)
+
         # d_W = grad_pred^T @ top_state_last
         delta_head = torch.matmul(grad_pred.T, top_state_last)
         delta_bias = grad_pred.sum(dim=0)
 
-        self.output_head.sub_(delta_head, alpha=self.eta_w * 5)
-        self.output_bias.sub_(delta_bias, alpha=self.eta_w * 5)
+        # Biological Weight Decay (Oja-inspired): Prevent synaptic overgrowth
+        weight_decay = 0.01
+
+        # Update Output Head with decay
+        self.output_head.sub_(delta_head + weight_decay * self.output_head, alpha=self.eta_w)
+        self.output_bias.sub_(delta_bias + weight_decay * self.output_bias, alpha=self.eta_w)
+
+        # Strict L2 Normalization constraint on the output weight to prevent it from inflating
+        self.output_head.data = F.normalize(self.output_head.data, p=2, dim=-1)
 
         # Update Input Projection (Sensory error)
         pred_l1, _ = self.layers[0].forward_predict(states[1])
@@ -150,10 +163,51 @@ class PCFinanceModel:
         err_l0_flat = err_l0.view(-1, self.hidden_size)
         x_seq_flat = x_seq.view(-1, 1)
         delta_input = torch.matmul(x_seq_flat.T, err_l0_flat)
-        self.input_proj.add_(delta_input, alpha=self.eta_w)
+
+        # Update Input Projection with decay
+        self.input_proj.add_(delta_input - weight_decay * self.input_proj, alpha=self.eta_w)
+        self.input_proj.data = F.normalize(self.input_proj.data, p=2, dim=-1)
 
         return mse_loss, total_energy
 
+    def print_parameter_summary(self):
+        print("-" * 105)
+        print(f"{'Component':<25} | {'Name':<15} | {'Shape':<20} | {'Parameters':<12} | {'Memory':<10} | {'Dtype'}")
+        print("-" * 105)
+
+        total_params = 0
+        total_bytes = 0
+
+        def add_param(component, name, tensor):
+            nonlocal total_params, total_bytes
+            num_params = tensor.numel()
+            mem_bytes = num_params * tensor.element_size()
+            total_params += num_params
+            total_bytes += mem_bytes
+
+            if mem_bytes >= 1024 ** 2:
+                mem_str = f"{mem_bytes / (1024**2):.2f} MB"
+            else:
+                mem_str = f"{mem_bytes / 1024:.2f} KB"
+
+            shape_str = str(list(tensor.shape))
+            print(f"{component:<25} | {name:<15} | {shape_str:<20} | {num_params:<12,d} | {mem_str:<10} | {str(tensor.dtype).replace('torch.', '')}")
+
+        add_param("Input Projection", "input_proj", self.input_proj)
+
+        for i, layer in enumerate(self.layers):
+            comp_name = f"PCFinanceLayer {i}"
+            add_param(comp_name, "W", layer.W)
+            add_param(comp_name, "b", layer.b)
+
+        add_param("Output Readout", "output_head", self.output_head)
+        add_param("Output Readout", "output_bias", self.output_bias)
+
+        print("-" * 105)
+        print(f"Total Parameters: {total_params:,}")
+        total_mem_str = f"{total_bytes / (1024**2):.2f} MB" if total_bytes >= 1024 ** 2 else f"{total_bytes / 1024:.2f} KB"
+        print(f"Total Estimated Memory: {total_mem_str}")
+        print("-" * 105)
 
 import yfinance as yf
 import numpy as np
@@ -207,12 +261,14 @@ def run_finance_training():
     # input_dim = 1 (just the price), hidden_size = 32 (tiny because it's just 1 number)
     model = PCFinanceModel(input_dim=1, hidden_size=32, num_layers=2)
 
+    model.print_parameter_summary()
+
     print(f"Data shape: {X.shape}")
     print("Starting Zero-Autograd Training...")
 
     # 3. Training Loop
     batch_size = 16
-    epochs = 3 # Small number of epochs for demonstration
+    epochs = 100 # Stress test: verify stability over 100 epochs
 
     with torch.no_grad():
         for epoch in range(epochs):
