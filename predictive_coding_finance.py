@@ -268,7 +268,7 @@ def run_finance_training():
 
     # 3. Training Loop
     batch_size = 16
-    epochs = 100 # Stress test: verify stability over 100 epochs
+    epochs = 1000 # Ultra stress test: verify dynamic equilibrium over 1000 epochs
 
     with torch.no_grad():
         for epoch in range(epochs):
@@ -286,7 +286,10 @@ def run_finance_training():
                 steps += 1
 
             avg_mse = total_mse / steps
-            print(f"Epoch {epoch+1}/{epochs} | Avg MSE Loss: {avg_mse:.6f}")
+
+            # Only print every 100 epochs to keep the console clean
+            if (epoch + 1) % 100 == 0 or epoch == 0:
+                print(f"Epoch {epoch+1}/{epochs} | Avg MSE Loss: {avg_mse:.6f}")
 
     # 4. Final Prediction Test
     with torch.no_grad():
