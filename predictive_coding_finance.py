@@ -215,6 +215,7 @@ import numpy as np
 def get_stock_data(ticker="AAPL", history="5y", seq_len=10):
     """
     Downloads historical stock data and prepares sliding windows for sequence prediction.
+    Uses rolling normalization to strictly prevent look-ahead bias.
     """
     print(f"Downloading {ticker} stock data...")
     stock = yf.Ticker(ticker)
@@ -223,29 +224,40 @@ def get_stock_data(ticker="AAPL", history="5y", seq_len=10):
     # We will just predict the 'Close' price
     prices = df['Close'].values
 
-    # Mathematical Guardrail: We MUST normalize the dollar values.
-    # Raw prices like $250.00 will explode the un-normalized input layer instantly.
-    # We will use simple min-max scaling to bound prices between 0 and 1.
-    price_min = np.min(prices)
-    price_max = np.max(prices)
-    normalized_prices = (prices - price_min) / (price_max - price_min)
+    X, Y = [], []
+    last_min, last_max = 0, 1 # Track for the final test de-normalization
 
     # Create sliding windows: look at `seq_len` days to predict day `seq_len + 1`
-    X, Y = [], []
-    for i in range(len(normalized_prices) - seq_len - 1):
-        # Shape: [seq_len, 1]
-        x_seq = normalized_prices[i : i + seq_len].reshape(-1, 1)
-        # Shape: [1]
-        y_target = normalized_prices[i + seq_len].reshape(1)
+    for i in range(len(prices) - seq_len - 1):
+        # Extract the local window of prices
+        local_window = prices[i : i + seq_len]
+        target_price = prices[i + seq_len]
 
-        X.append(x_seq)
-        Y.append(y_target)
+        # Mathematical Guardrail & Zero Look-Ahead Bias:
+        # We normalize the data using ONLY the min and max of this specific historical window.
+        # This guarantees the model never sees future price ceilings/floors.
+        window_min = np.min(local_window)
+        window_max = np.max(local_window)
+
+        # Prevent division by zero if stock flatlines
+        if window_max == window_min:
+            window_max += 1e-5
+
+        x_seq_norm = (local_window - window_min) / (window_max - window_min)
+        # We must scale the target using the SAME historical window's scale
+        y_target_norm = (target_price - window_min) / (window_max - window_min)
+
+        X.append(x_seq_norm.reshape(-1, 1))
+        Y.append(np.array([y_target_norm]))
+
+        # Save the min/max of the final window so we can de-normalize the test prediction later
+        last_min, last_max = window_min, window_max
 
     # Convert to PyTorch Tensors
     X_tensor = torch.tensor(np.array(X), dtype=torch.float32)
     Y_tensor = torch.tensor(np.array(Y), dtype=torch.float32)
 
-    return X_tensor, Y_tensor, price_min, price_max
+    return X_tensor, Y_tensor, last_min, last_max
 
 
 def run_finance_training():
@@ -255,7 +267,7 @@ def run_finance_training():
 
     # 1. Fetch Data
     seq_len = 10
-    X, Y, price_min, price_max = get_stock_data(ticker="AAPL", history="2y", seq_len=seq_len)
+    X, Y, last_test_min, last_test_max = get_stock_data(ticker="AAPL", history="2y", seq_len=seq_len)
 
     # 2. Initialize Model
     # input_dim = 1 (just the price), hidden_size = 32 (tiny because it's just 1 number)
@@ -307,9 +319,9 @@ def run_finance_training():
         top_state_last = current_x[:, -1, :]
         prediction_normalized = torch.matmul(top_state_last, model.output_head.T) + model.output_bias
 
-        # De-normalize to get real dollar values
-        predicted_price = prediction_normalized.item() * (price_max - price_min) + price_min
-        actual_price = actual_normalized.item() * (price_max - price_min) + price_min
+        # De-normalize to get real dollar values (using the specific scale from the final test window)
+        predicted_price = prediction_normalized.item() * (last_test_max - last_test_min) + last_test_min
+        actual_price = actual_normalized.item() * (last_test_max - last_test_min) + last_test_min
 
         print("\n" + "="*50)
         print("Final Sequence Prediction Test")
