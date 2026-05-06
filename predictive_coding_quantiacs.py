@@ -209,7 +209,13 @@ def strategy(data, state):
 
     # We are operating in the crypto_daily_long environment.
     # Data shape is typically (field, time, asset)
-    close_prices = data.sel(field='close').values # [time, asset]
+
+    # Mathematical Guardrail: Prevent NaN Poisoning!
+    # Many coins did not exist in 2014, so their prices are NaN.
+    # We forward-fill gaps, and fill non-existent coins with 0.0 to keep the math stable.
+    close_xr = data.sel(field='close').ffill('time').fillna(0)
+
+    close_prices = close_xr.values # [time, asset]
     assets = data.asset.values
     num_assets = len(assets)
 
