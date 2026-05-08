@@ -176,10 +176,8 @@ class PCQuantConnectModel:
 
 
 # Only define the class if QCAlgorithm is available (in QuantConnect) or mock it
-class MockQCAlgorithm:
-    pass
-
-QCAlgorithm = globals().get('QCAlgorithm', MockQCAlgorithm)
+if 'QCAlgorithm' not in globals():
+    class QCAlgorithm: pass
 
 class PredictiveCodingAlgorithm(QCAlgorithm):
 
@@ -188,11 +186,12 @@ class PredictiveCodingAlgorithm(QCAlgorithm):
         self.SetCash(100000)
 
         # Request Crypto Data
-        self.symbol = self.AddCrypto("BTCUSD", Resolution.Daily).Symbol
+        self.symbol = self.AddCrypto("BTCUSD", Resolution.DAILY).Symbol
 
         # Configuration
         self.seq_len = 10
-        self.window = RollingWindow[float](self.seq_len + 1)
+        # Renamed from self.window to avoid shadowing C# properties
+        self.price_window = RollingWindow[float](self.seq_len + 1)
 
         # Initialize biological brain
         # We disable autograd completely for extreme efficiency
@@ -200,23 +199,23 @@ class PredictiveCodingAlgorithm(QCAlgorithm):
         self.model = PCQuantConnectModel(input_dim=1, hidden_size=128, num_layers=2)
 
         # Warm up the window so the model can trade on Day 1
-        history = self.History(self.symbol, self.seq_len + 1, Resolution.Daily)
+        history = self.History(self.symbol, self.seq_len + 1, Resolution.DAILY)
         if not history.empty:
             for index, row in history.iterrows():
-                self.window.Add(float(row["close"]))
+                self.price_window.Add(float(row["close"]))
 
     def OnData(self, data):
         if not data.ContainsKey(self.symbol):
             return
 
         # Add new daily price
-        self.window.Add(float(data[self.symbol].Close))
+        self.price_window.Add(float(data[self.symbol].Close))
 
-        if not self.window.IsReady:
+        if not self.price_window.IsReady:
             return
 
         # Extract the prices from the rolling window (it stores newest first, so we reverse it)
-        prices = np.array([self.window[i] for i in range(self.window.Count - 1, -1, -1)])
+        prices = np.array([self.price_window[i] for i in range(self.price_window.Count - 1, -1, -1)])
 
         # Strict zero look-ahead bias normalization
         window_min = np.min(prices)
