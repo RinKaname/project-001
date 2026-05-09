@@ -267,11 +267,10 @@ def test_training():
     with torch.no_grad():
         model = PCImageModel(image_size=IMG_SIZE, channels=3, hidden_dim=16, num_layers=2)
 
-    print("Loading Dataset: animelover/princess-connect-images (Streaming mode)")
+    print("Loading Dataset: BangumiBase/princessconnectredive (Streaming mode)")
     try:
-        # Load a tiny subset in streaming mode to test
-        # We will use another dataset because huggingface dataset >= 3.0 blocks scripts completely
-        dataset = load_dataset("huggan/smithsonian_butterflies_subset", split="train", streaming=True)
+        # User requested alternative script-free dataset
+        dataset = load_dataset("BangumiBase/princessconnectredive", split="train", streaming=True)
     except Exception as e:
         print(f"Failed to load dataset: {e}")
         return
